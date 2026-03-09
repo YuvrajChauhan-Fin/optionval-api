@@ -206,7 +206,9 @@ def get_quote(ticker: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Error fetching quote: {str(e)}")
+        tb = traceback.format_exc()
+        print(f"ERROR [quote/{ticker}]: {e}\n{tb}", flush=True)
+        raise HTTPException(500, detail={"error": str(e), "traceback": tb})
 
 
 @app.get("/api/chain/{ticker}")
@@ -314,7 +316,9 @@ def get_options_chain(ticker: str, expiry: str = None):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Chain error: {str(e)}\n{traceback.format_exc()}")
+        tb = traceback.format_exc()
+        print(f"ERROR [chain/{ticker}]: {e}\n{tb}", flush=True)
+        raise HTTPException(500, detail={"error": str(e), "traceback": tb})
 
 
 @app.get("/api/surface/{ticker}")
@@ -440,7 +444,9 @@ def get_model_comparison(ticker: str, expiry: str = None):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Comparison error: {str(e)}")
+        tb = traceback.format_exc()
+        print(f"ERROR [compare/{ticker}]: {e}\n{tb}", flush=True)
+        raise HTTPException(500, detail={"error": str(e), "traceback": tb})
 
 
 @app.get("/api/search")
