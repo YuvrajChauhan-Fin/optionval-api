@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from scipy.stats import norm
+import math
 from datetime import datetime, date
 import traceback
 
@@ -46,10 +46,10 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 def norm_cdf(x):
-    return float(norm.cdf(x))
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def norm_pdf(x):
-    return float(norm.pdf(x))
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
 def bs_d1d2(S, K, T, r, sigma, q=0):
     sqrt_T = np.sqrt(T)
@@ -102,14 +102,7 @@ def implied_vol(market_price, S, K, T, r, q=0, option_type='call'):
             break
         sigma -= err/vega
         sigma = max(sigma, 0.001)
-    # Brent fallback
-    try:
-        from scipy.optimize import brentq
-        iv = brentq(lambda s: bs_price(S,K,T,r,s,q,option_type)-market_price,
-                    1e-4, 10.0, xtol=1e-7, maxiter=500)
-        return round(float(iv), 6)
-    except:
-        return None
+    return None
 
 # ---------------------------------------------------------------------------
 # MARKET DETECTION
