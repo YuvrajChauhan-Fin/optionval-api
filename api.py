@@ -225,8 +225,8 @@ def get_options_chain(ticker: str, expiry: str = None):
                 bid         = float(row.get('bid') or 0)
                 ask         = float(row.get('ask') or 0)
                 mid         = (bid+ask)/2 if bid>0 and ask>0 else market_px
-                volume      = int(pd.to_numeric(row.get('volume') or 0, errors='coerce') or 0)
-                oi          = int(pd.to_numeric(row.get('openInterest') or 0, errors='coerce') or 0)
+                volume      = int(float(str(row.get('volume') or 0).replace('nan', '0')))
+                oi          = int(float(str(row.get('openInterest') or 0).replace('nan', '0')))
 
                 if mid <= 0 and market_px <= 0:
                     continue
