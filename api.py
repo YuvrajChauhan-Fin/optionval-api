@@ -24,6 +24,7 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import math
+import time
 from datetime import datetime, date
 import traceback
 
@@ -40,6 +41,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# IN-MEMORY CACHE  (5-minute TTL)
+# ---------------------------------------------------------------------------
+
+_cache: dict = {}
+CACHE_TTL = 300  # seconds
+
+def cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and (time.time() - entry['ts']) < CACHE_TTL:
+        return entry['data']
+    return None
+
+def cache_set(key: str, data):
+    _cache[key] = {'data': data, 'ts': time.time()}
 
 # ---------------------------------------------------------------------------
 # BLACK-SCHOLES ENGINE (self-contained, no import dependency)
@@ -137,7 +154,12 @@ def get_quote(ticker: str):
     Live stock quote + company metadata.
     Returns everything needed to populate the UI header.
     """
+    cache_key = f"quote:{ticker.upper()}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
     try:
+        time.sleep(2)
         t    = yf.Ticker(ticker.upper())
         info = t.info
         hist = t.history(period="2d")
@@ -160,7 +182,7 @@ def get_quote(ticker: str):
         else:
             hist_vol = 0.25
 
-        return {
+        result = {
             "ticker":       ticker.upper(),
             "name":         info.get('longName', ticker.upper()),
             "sector":       info.get('sector', 'N/A'),
@@ -179,6 +201,8 @@ def get_quote(ticker: str):
             "flag":         market_info['flag'],
             "timestamp":    datetime.utcnow().isoformat(),
         }
+        cache_set(cache_key, result)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -197,9 +221,14 @@ def get_options_chain(ticker: str, expiry: str = None):
     - Full Greeks
     - Moneyness classification
     """
+    cache_key = f"chain:{ticker.upper()}:{expiry or ''}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
     try:
-        t           = yf.Ticker(ticker.upper())
         quote       = get_quote(ticker)
+        time.sleep(2)
+        t           = yf.Ticker(ticker.upper())
         S           = quote['price']
         r           = quote['risk_free_rate']
         q           = quote['dividend_yield']
@@ -267,7 +296,7 @@ def get_options_chain(ticker: str, expiry: str = None):
         calls = process_chain(chain.calls, 'call')
         puts  = process_chain(chain.puts,  'put')
 
-        return {
+        result = {
             'ticker':        ticker.upper(),
             'spot':          S,
             'expiry':        target_exp,
@@ -280,6 +309,8 @@ def get_options_chain(ticker: str, expiry: str = None):
             'total_contracts': len(calls)+len(puts),
             'timestamp':     datetime.utcnow().isoformat(),
         }
+        cache_set(cache_key, result)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -292,9 +323,14 @@ def get_vol_surface(ticker: str):
     Volatility surface: IV across all strikes and all expiries.
     Returns structured data for 3D surface plotting.
     """
+    cache_key = f"surface:{ticker.upper()}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
     try:
-        t        = yf.Ticker(ticker.upper())
         quote    = get_quote(ticker)
+        time.sleep(2)
+        t        = yf.Ticker(ticker.upper())
         S        = quote['price']
         r        = quote['risk_free_rate']
         q        = quote['dividend_yield']
@@ -332,7 +368,7 @@ def get_vol_surface(ticker: str):
             except:
                 continue
 
-        return {
+        result = {
             'ticker':       ticker.upper(),
             'spot':         S,
             'surface':      surface_data,
@@ -340,6 +376,8 @@ def get_vol_surface(ticker: str):
             'points':       len(surface_data),
             'timestamp':    datetime.utcnow().isoformat(),
         }
+        cache_set(cache_key, result)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -352,6 +390,10 @@ def get_model_comparison(ticker: str, expiry: str = None):
     Model vs Market: Where is BS mispricing relative to market IV?
     The core research output — identifies systematic over/under-pricing.
     """
+    cache_key = f"compare:{ticker.upper()}:{expiry or ''}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
     try:
         chain_data = get_options_chain(ticker, expiry)
         S          = chain_data['spot']
@@ -380,7 +422,7 @@ def get_model_comparison(ticker: str, expiry: str = None):
         max_over     = max(comparison, key=lambda x: x['mispricing']) if comparison else {}
         max_under    = min(comparison, key=lambda x: x['mispricing']) if comparison else {}
 
-        return {
+        result = {
             'ticker':          ticker.upper(),
             'spot':            S,
             'expiry':          chain_data['expiry'],
@@ -393,6 +435,8 @@ def get_model_comparison(ticker: str, expiry: str = None):
             },
             'timestamp': datetime.utcnow().isoformat(),
         }
+        cache_set(cache_key, result)
+        return result
     except HTTPException:
         raise
     except Exception as e:
