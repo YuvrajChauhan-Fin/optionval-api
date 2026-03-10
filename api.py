@@ -1,12 +1,20 @@
 """
 Options Valuation Engine — FastAPI Backend
 ==========================================
-Phase 4.1: Strict 3-call budget per cold page load
+Phase 4.2: Confirmed free-tier endpoints only
 
-Cold /api/chain/{ticker} call sequence (max 3 HTTP calls total):
-  Call 1: /v2/snapshot/locale/us/markets/stocks/tickers/{ticker}  → price
-  Call 2: /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}        → hist vol
-  Call 3: /v3/reference/options/contracts                         → strikes
+Confirmed working on Massive.com free tier:
+  ✅ /v2/aggs/ticker/{sym}/range/1/day/{from}/{to}  ← price + hist vol
+  ✅ /v3/reference/options/contracts                ← strikes + expiries
+  ✅ /v3/reference/tickers/{sym}                    ← name (best-effort)
+  ❌ /v2/snapshot/...                               ← 403 NOT_AUTHORIZED
+
+Cold /api/chain/{ticker} call sequence (max 2 HTTP calls total):
+  Call 1: /v2/aggs/ticker/{sym}/range/1/day/{from}/{to}  → price + hist vol
+  Call 2: /v3/reference/options/contracts                → strikes + expiries
+
+  Optional Call 3 (best-effort, non-blocking):
+          /v3/reference/tickers/{sym}                    → company name
 
 Everything downstream reuses caches — zero additional calls.
 
@@ -30,8 +38,8 @@ import traceback
 
 app = FastAPI(
     title="Options Valuation Engine API",
-    description="Phase 4.1: Massive.com · strict 3-call budget",
-    version="4.1"
+    description="Phase 4.2: Massive.com confirmed free-tier endpoints",
+    version="4.2"
 )
 
 app.add_middleware(
@@ -155,8 +163,11 @@ def time_to_expiry(expiration_date_str: str) -> float:
     T = (exp - datetime.utcnow()).days / 365
     return max(T, 0.001)
 
-def massive_req(path: str, params: dict = None, timeout: int = 10) -> dict:
-    """Generic Massive.com REST call (snapshot, aggs). apiKey added automatically."""
+def mget(path: str, params: dict = None, timeout: int = 10) -> dict:
+    """
+    Unified Massive.com REST helper — apiKey query-param auth.
+    Used for ALL Massive.com calls throughout this file.
+    """
     if params is None:
         params = {}
     params["apiKey"] = MASSIVE_API_KEY
@@ -164,23 +175,25 @@ def massive_req(path: str, params: dict = None, timeout: int = 10) -> dict:
     try:
         resp = requests.get(url, params=params, timeout=timeout)
     except requests.Timeout:
-        raise HTTPException(504, detail=f"Massive.com timed out: {path}")
+        raise HTTPException(504, f"Timed out: {path}")
     except requests.ConnectionError as e:
-        raise HTTPException(503, detail=f"Connection error: {e}")
-    if resp.status_code == 429:
-        raise HTTPException(429, detail="Rate limit reached. Please wait 30 seconds and retry.")
+        raise HTTPException(503, f"Connection error: {e}")
     if resp.status_code == 403:
-        raise HTTPException(403, detail="Massive.com plan does not include this endpoint.")
+        raise HTTPException(403,
+            f"Massive.com free tier does not include this endpoint: {path}")
+    if resp.status_code == 429:
+        raise HTTPException(429,
+            "Rate limit reached. Please wait 30 seconds and try again.")
     if resp.status_code == 404:
         return {}
     if resp.status_code != 200:
-        raise HTTPException(resp.status_code, detail=f"Massive.com error: {resp.text[:200]}")
+        raise HTTPException(resp.status_code, f"API error: {resp.text[:200]}")
     return resp.json()
 
 def fetch_option_contracts(ticker: str, spot: float) -> list:
     """
-    Call 3 — ONE call, no pagination, cached for 5 min.
-    Shared by get_options_chain() and get_vol_surface().
+    ONE call to /v3/reference/options/contracts. No pagination.
+    Cached for 5 min — shared by get_options_chain() and get_vol_surface().
     250 contracts at ±20% of spot covers all liquid strikes.
     """
     sym       = ticker.upper()
@@ -189,8 +202,8 @@ def fetch_option_contracts(ticker: str, spot: float) -> list:
     if cached is not None:
         return cached
 
-    today  = datetime.now(tz=timezone.utc).date().isoformat()
-    params = {
+    today = datetime.now(tz=timezone.utc).date().isoformat()
+    resp  = mget("/v3/reference/options/contracts", params={
         "underlying_ticker":   sym,
         "expiration_date.gte": today,
         "expired":             "false",
@@ -199,25 +212,8 @@ def fetch_option_contracts(ticker: str, spot: float) -> list:
         "limit":               250,
         "order":               "asc",
         "sort":                "expiration_date",
-        "apiKey":              MASSIVE_API_KEY,
-    }
-    url = f"{MASSIVE_BASE}/v3/reference/options/contracts"
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-    except requests.Timeout:
-        raise HTTPException(504, "Massive.com timed out fetching contracts.")
-    except requests.ConnectionError as e:
-        raise HTTPException(503, f"Connection error: {e}")
-
-    if resp.status_code == 429:
-        raise HTTPException(429,
-            "Rate limit reached. Data is cached — please wait 30 seconds and retry.")
-    if resp.status_code != 200:
-        raise HTTPException(resp.status_code,
-            f"Massive.com error: {resp.text[:200]}")
-
-    results = resp.json().get("results", [])
-    # No pagination — 250 contracts at ±20% of spot is sufficient
+    })
+    results = resp.get("results", [])
     cache_set(cache_key, results)
     return results
 
@@ -227,16 +223,21 @@ def fetch_option_contracts(ticker: str, spot: float) -> list:
 
 @app.get("/health")
 def health():
-    return {"status": "online", "timestamp": datetime.utcnow().isoformat(), "version": "4.1"}
+    return {"status": "online", "timestamp": datetime.utcnow().isoformat(), "version": "4.2"}
 
 
 @app.get("/api/quote/{ticker}")
 def get_quote(ticker: str):
     """
-    Stock quote — exactly 2 Massive.com calls on cache miss:
-      Call 1: /v2/snapshot/locale/us/markets/stocks/tickers/{sym}   → price
-      Call 2: /v2/aggs/ticker/{sym}/range/1/day/{from}/{to}         → hist vol
-    No call for company name — saves 1 call, name defaults to ticker.
+    Stock quote — 1 confirmed call + 1 optional best-effort call:
+
+      Call 1 (required): /v2/aggs/ticker/{sym}/range/1/day/{from}/{to}
+        → last bar close = price, second-to-last = prev_close
+        → hist_vol computed from all 30 closes in the same response
+        → week52 high/low from the same bar array
+
+      Call 2 (optional, non-blocking): /v3/reference/tickers/{sym}
+        → company name only; falls back to sym on any failure
     """
     cache_key = f"quote:{ticker.upper()}"
     cached = cache_get(cache_key, ttl=CACHE_TTL["quote"])
@@ -247,47 +248,44 @@ def get_quote(ticker: str):
         market_info = detect_market(ticker)
         r           = get_risk_free_rate(market_info['market'])
 
-        # ── Call 1: snapshot → price, prev close, volume ──────────────────
-        snap     = massive_req(f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}")
-        t_data   = snap.get('ticker', {})
-        if not t_data:
-            raise HTTPException(404, f"No snapshot data for '{ticker}'")
-
-        day        = t_data.get('day', {})
-        prev_day   = t_data.get('prevDay', {})
-        last_trade = t_data.get('lastTrade', {})
-
-        price      = float(day.get('c') or last_trade.get('p') or 0)
-        prev_close = float(prev_day.get('c') or price)
-        volume     = int(day.get('v') or 0)
-
-        if not price:
-            raise HTTPException(404, f"No price data for '{ticker}'")
-
-        # ── Call 2: 30-day daily bars → historical vol ────────────────────
+        # ── Call 1: 45-day daily bars → price + hist vol (one request) ────
         from_date = (date.today() - timedelta(days=45)).isoformat()
         to_date   = date.today().isoformat()
-        bars_resp = massive_req(
+        bars_resp = mget(
             f"/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
             params={'adjusted': 'true', 'sort': 'asc', 'limit': 50}
         )
-        hist_vol    = 0.25   # fallback if insufficient history
-        week52_high = None
-        week52_low  = None
         bars = bars_resp.get('results', [])
-        if len(bars) >= 5:
-            closes      = [float(b['c']) for b in bars]
-            log_ret     = [np.log(closes[i]/closes[i-1]) for i in range(1, len(closes))]
-            hist_vol    = float(np.std(log_ret) * np.sqrt(252))
-            week52_high = max(float(b['h']) for b in bars)
-            week52_low  = min(float(b['l']) for b in bars)
+        if len(bars) < 2:
+            raise HTTPException(404, f"No price data found for '{ticker}'")
+
+        last     = bars[-1]
+        prev     = bars[-2]
+        price      = float(last['c'])
+        prev_close = float(prev['c'])
+        volume     = int(last['v'])
+
+        closes      = [float(b['c']) for b in bars]
+        log_ret     = [np.log(closes[i]/closes[i-1]) for i in range(1, len(closes))]
+        hist_vol    = float(np.std(log_ret) * np.sqrt(252))
+        week52_high = max(float(b['h']) for b in bars)
+        week52_low  = min(float(b['l']) for b in bars)
 
         change     = price - prev_close
         change_pct = (change / prev_close * 100) if prev_close else 0
 
+        # ── Call 2: reference ticker → company name (best-effort) ─────────
+        name = sym
+        try:
+            ref  = mget(f"/v3/reference/tickers/{sym}")
+            name = ref.get('results', {}).get('name') or sym
+        except Exception as ref_err:
+            print(f"WARN [quote/{sym}] reference/tickers failed (non-fatal): {ref_err}",
+                  flush=True)
+
         result = {
             "ticker":         sym,
-            "name":           sym,   # No extra call for company name
+            "name":           name,
             "sector":         'N/A',
             "price":          round(price, 2),
             "prev_close":     round(prev_close, 2),
@@ -295,8 +293,8 @@ def get_quote(ticker: str):
             "change_pct":     round(change_pct, 3),
             "volume":         volume,
             "market_cap":     0,
-            "week52_high":    round(week52_high, 2) if week52_high else None,
-            "week52_low":     round(week52_low, 2)  if week52_low  else None,
+            "week52_high":    round(week52_high, 2),
+            "week52_low":     round(week52_low, 2),
             "dividend_yield": 0.0,
             "hist_vol_30d":   round(hist_vol, 4),
             "risk_free_rate": r,
@@ -319,9 +317,9 @@ def get_quote(ticker: str):
 @app.get("/api/chain/{ticker}")
 def get_options_chain(ticker: str, expiry: str = None):
     """
-    Options chain — exactly 1 new call (Call 3) on cache miss.
-    get_quote() is called first (cache hit after first load).
-    fetch_option_contracts() result is shared with /api/surface/.
+    Options chain — zero new calls if quote is cached.
+    fetch_option_contracts() makes the only new HTTP call (Call 2),
+    and its result is shared with /api/surface/ at zero cost.
     """
     cache_key = f"chain:{ticker.upper()}:{expiry or ''}"
     cached = cache_get(cache_key, ttl=CACHE_TTL["chain"])
@@ -335,7 +333,7 @@ def get_options_chain(ticker: str, expiry: str = None):
         sigma = quote['hist_vol_30d']
         sym   = ticker.upper()
 
-        # Call 3 — cached for 5 min, reused by /api/surface/ at zero cost
+        # Contracts call — cached for 5 min, reused by /api/surface/
         results = fetch_option_contracts(sym, S)
         if not results:
             raise HTTPException(404, f"No options contracts found for {sym}.")
@@ -424,7 +422,6 @@ def get_vol_surface(ticker: str):
         if not results:
             raise HTTPException(404, "No options data for surface construction.")
 
-        # Calls only for surface (one line per strike/expiry combination)
         call_contracts = [c for c in results if c['contract_type'] == 'call']
 
         all_exp_sorted = sorted(set(c['expiration_date'] for c in call_contracts))
@@ -447,7 +444,6 @@ def get_vol_surface(ticker: str):
                 'moneyness':     round(K/S, 4),
             })
 
-        # Build grid for 3D / heatmap renderers
         all_strikes  = sorted(set(p['strike'] for p in surface_data))
         all_expiries = sorted(set(p['expiry'] for p in surface_data))
         iv_lookup    = {(p['expiry'], p['strike']): p['iv'] for p in surface_data}
