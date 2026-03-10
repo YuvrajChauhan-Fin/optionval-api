@@ -173,59 +173,88 @@ def health():
 @app.get("/api/quote/{ticker}")
 def get_quote(ticker: str):
     """
-    Live stock quote using fast_info (low-rate-limit endpoint) +
-    yf.download() for price history and historical volatility.
+    Robust quote endpoint with layered fallbacks:
+      1. fast_info  — price, market cap, 52-week range (fast, low rate-limit)
+      2. t.history  — 30d OHLCV for historical vol (separate endpoint)
+      3. t.info     — name, sector, dividend yield (slower; isolated try/except)
+      4. yf.download — last-resort price if fast_info fails entirely
     """
     cache_key = f"quote:{ticker.upper()}"
     cached = cache_get(cache_key)
     if cached:
         return cached
     try:
-        t    = yf.Ticker(ticker.upper(), session=_session)
-        fi   = t.fast_info
-
-        # Price history via download (separate endpoint, not rate limited same way)
-        hist = yf.download(ticker.upper(), period="30d", progress=False, session=_session)
-        hist = flatten_download(hist)
-
-        if hist.empty:
-            raise HTTPException(404, f"No data found for ticker '{ticker}'")
-
-        close        = hist['Close'].dropna()
-        price        = float(safe_fast(fi, 'last_price') or close.iloc[-1])
-        prev_close   = float(safe_fast(fi, 'previous_close') or (close.iloc[-2] if len(close) > 1 else price))
-        change       = price - prev_close
-        change_pct   = (change / prev_close) * 100 if prev_close else 0
-
+        sym          = ticker.upper()
         market_info  = detect_market(ticker)
         r            = get_risk_free_rate(market_info['market'])
+        t            = yf.Ticker(sym, session=_session)
 
-        # Use fast_info currency/exchange if available, fall back to market detection
-        currency     = safe_fast(fi, 'currency') or market_info['currency']
-        exchange     = safe_fast(fi, 'exchange') or market_info['exchange']
-
-        # 30-day historical volatility from download data
-        if len(close) >= 5:
-            log_returns = np.log(close / close.shift(1)).dropna()
-            hist_vol    = float(log_returns.std() * np.sqrt(252))
-        else:
-            hist_vol = 0.25
-
+        # ── 1. fast_info: price + market metadata ──────────────────────────
+        fi           = t.fast_info
+        price        = safe_fast(fi, 'last_price')
+        prev_close   = safe_fast(fi, 'previous_close')
         market_cap   = safe_fast(fi, 'market_cap') or 0
         volume       = safe_fast(fi, 'three_month_average_volume') \
                        or safe_fast(fi, 'regular_market_volume') or 0
+        week52_high  = safe_fast(fi, 'fifty_two_week_high')
+        week52_low   = safe_fast(fi, 'fifty_two_week_low')
+        currency     = safe_fast(fi, 'currency') or market_info['currency']
+        exchange     = safe_fast(fi, 'exchange') or market_info['exchange']
+
+        # ── 2. t.history: 30-day OHLCV for historical vol ─────────────────
+        hist         = t.history(period='30d')
+        hist_vol     = 0.25  # default
+        if not hist.empty:
+            close    = hist['Close'].dropna()
+            if len(close) >= 5:
+                log_returns = np.log(close / close.shift(1)).dropna()
+                hist_vol    = float(log_returns.std() * np.sqrt(252))
+            # fill price from history if fast_info gave nothing
+            if not price and len(close):
+                price = float(close.iloc[-1])
+            if not prev_close and len(close) > 1:
+                prev_close = float(close.iloc[-2])
+
+        # ── 3. yf.download fallback if price still missing ─────────────────
+        if not price:
+            dl   = yf.download(sym, period='1d', progress=False, session=_session)
+            dl   = flatten_download(dl)
+            if not dl.empty:
+                price = float(dl['Close'].dropna().iloc[-1])
+
+        if not price:
+            raise HTTPException(404, f"No price data found for '{ticker}'")
+
+        if not prev_close:
+            prev_close = price
+        change     = price - prev_close
+        change_pct = (change / prev_close) * 100 if prev_close else 0
+
+        # ── 4. t.info: name, sector, dividend yield (best-effort) ──────────
+        name           = sym
+        sector         = 'N/A'
+        dividend_yield = 0.0
+        try:
+            info           = t.info
+            name           = info.get('longName') or info.get('shortName') or sym
+            sector         = info.get('sector') or 'N/A'
+            dividend_yield = round(min(max(float(info.get('dividendYield') or 0), 0), 0.20), 4)
+        except Exception as info_err:
+            print(f"WARN [quote/{sym}] t.info failed (non-fatal): {info_err}", flush=True)
 
         result = {
-            "ticker":         ticker.upper(),
-            "name":           ticker.upper(),   # fast_info does not expose longName
-            "sector":         "N/A",            # fast_info does not expose sector
+            "ticker":         sym,
+            "name":           name,
+            "sector":         sector,
             "price":          round(price, 2),
             "prev_close":     round(prev_close, 2),
             "change":         round(change, 2),
             "change_pct":     round(change_pct, 3),
             "volume":         int(volume or 0),
             "market_cap":     int(market_cap or 0),
-            "dividend_yield": 0.0,              # fast_info does not expose dividend yield
+            "week52_high":    round(week52_high, 2) if week52_high else None,
+            "week52_low":     round(week52_low, 2)  if week52_low  else None,
+            "dividend_yield": dividend_yield,
             "hist_vol_30d":   round(hist_vol, 4),
             "risk_free_rate": r,
             "currency":       currency,
