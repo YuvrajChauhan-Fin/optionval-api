@@ -274,11 +274,16 @@ def get_quote(ticker: str):
         change     = price - prev_close
         change_pct = (change / prev_close * 100) if prev_close else 0
 
-        # ── Call 2: reference ticker → company name (best-effort) ─────────
-        name = sym
+        # ── Call 2: reference ticker → name, sector, market_cap (best-effort) ──
+        name       = sym
+        market_cap = 0
+        sector     = 'N/A'
         try:
-            ref  = mget(f"/v3/reference/tickers/{sym}")
-            name = ref.get('results', {}).get('name') or sym
+            ref      = mget(f"/v3/reference/tickers/{sym}")
+            ref_data = ref.get('results', {})
+            name       = ref_data.get('name') or sym
+            market_cap = int(ref_data.get('market_cap') or 0)
+            sector     = ref_data.get('sic_description') or 'N/A'
         except Exception as ref_err:
             print(f"WARN [quote/{sym}] reference/tickers failed (non-fatal): {ref_err}",
                   flush=True)
@@ -286,13 +291,13 @@ def get_quote(ticker: str):
         result = {
             "ticker":         sym,
             "name":           name,
-            "sector":         'N/A',
+            "sector":         sector,
             "price":          round(price, 2),
             "prev_close":     round(prev_close, 2),
             "change":         round(change, 2),
             "change_pct":     round(change_pct, 3),
             "volume":         volume,
-            "market_cap":     0,
+            "market_cap":     market_cap,
             "week52_high":    round(week52_high, 2),
             "week52_low":     round(week52_low, 2),
             "dividend_yield": 0.0,
@@ -427,14 +432,14 @@ def get_vol_surface(ticker: str):
         all_exp_sorted = sorted(set(c['expiration_date'] for c in call_contracts))
         expiries_used  = all_exp_sorted[:6]
 
-        surface_data = []
+        raw_surface = []
         for c in call_contracts:
             if c['expiration_date'] not in expiries_used:
                 continue
             K    = float(c['strike_price'])
             T    = time_to_expiry(c['expiration_date'])
-            days = round(T * 365)
-            surface_data.append({
+            days = max(round(T * 365), 1)
+            raw_surface.append({
                 'strike':        round(K, 2),
                 'expiry':        c['expiration_date'],
                 'days':          days,
@@ -443,6 +448,25 @@ def get_vol_surface(ticker: str):
                 'log_moneyness': round(float(np.log(K/S)), 4),
                 'moneyness':     round(K/S, 4),
             })
+
+        # Filter out contracts expiring today (T < 0.003 ≈ 1 day) — avoids days=0 chart crash
+        surface_data = [p for p in raw_surface if p['T'] >= 0.003]
+
+        if not surface_data:
+            result = {
+                'ticker':        sym,
+                'spot':          S,
+                'surface':       [],
+                'expiries':      [],
+                'strikes':       [],
+                'iv_grid':       [],
+                'expiries_used': expiries_used,
+                'points':        0,
+                'message':       'Insufficient data — all contracts near expiry',
+                'timestamp':     datetime.utcnow().isoformat(),
+            }
+            cache_set(cache_key, result)
+            return result
 
         all_strikes  = sorted(set(p['strike'] for p in surface_data))
         all_expiries = sorted(set(p['expiry'] for p in surface_data))
