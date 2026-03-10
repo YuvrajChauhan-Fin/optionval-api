@@ -12,9 +12,7 @@ Endpoints:
   GET /health                      — Server health check
 
 Market support:
-  US  — Full options chain (AAPL, SPY, TSLA, etc.)
-  NSE — Stock prices + limited options (RELIANCE.NS, INFY.NS)
-  BSE — Stock prices (RELIANCE.BO)
+  US — Full options chain (AAPL, SPY, TSLA, etc.)
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -135,17 +133,10 @@ def implied_vol(market_price, S, K, T, r, q=0, option_type='call'):
 # ---------------------------------------------------------------------------
 
 def detect_market(ticker: str) -> dict:
-    t = ticker.upper()
-    if t.endswith('.NS'):
-        return {'market': 'NSE', 'currency': 'INR', 'flag': '🇮🇳', 'exchange': 'NSE'}
-    elif t.endswith('.BO'):
-        return {'market': 'BSE', 'currency': 'INR', 'flag': '🇮🇳', 'exchange': 'BSE'}
-    else:
-        return {'market': 'US', 'currency': 'USD', 'flag': '🇺🇸', 'exchange': 'NASDAQ/NYSE'}
+    return {'market': 'US', 'currency': 'USD', 'flag': '🇺🇸', 'exchange': 'NASDAQ/NYSE'}
 
 def get_risk_free_rate(market: str) -> float:
-    rates = {'US': 0.0525, 'NSE': 0.067, 'BSE': 0.067}
-    return rates.get(market, 0.05)
+    return 0.0525
 
 def safe_fast(fi, attr, default=None):
     """Safely read a fast_info attribute, returning default on any failure."""
@@ -293,8 +284,7 @@ def get_options_chain(ticker: str, expiry: str = None):
         expiries = t.options
 
         if not expiries:
-            raise HTTPException(404, f"No options data available for {ticker}. "
-                                     f"Note: Indian market options may have limited coverage.")
+            raise HTTPException(404, f"No options data available for {ticker}.")
 
         target_exp = expiry if expiry in expiries else expiries[0]
         chain      = t.option_chain(target_exp)
@@ -506,24 +496,18 @@ def get_model_comparison(ticker: str, expiry: str = None):
 
 @app.get("/api/search")
 def search_tickers(q: str = Query(..., min_length=1)):
-    """Quick ticker suggestions including Indian market."""
+    """Quick ticker suggestions — US markets only."""
     suggestions = {
-        # US
         'AAPL': 'Apple Inc.', 'MSFT': 'Microsoft', 'GOOGL': 'Alphabet',
         'AMZN': 'Amazon', 'TSLA': 'Tesla', 'NVDA': 'NVIDIA',
         'SPY': 'S&P 500 ETF', 'QQQ': 'Nasdaq ETF', 'META': 'Meta',
         'JPM': 'JPMorgan', 'GS': 'Goldman Sachs', 'MS': 'Morgan Stanley',
-        # India NSE
-        'RELIANCE.NS': 'Reliance Industries', 'TCS.NS': 'Tata Consultancy',
-        'INFY.NS': 'Infosys', 'HDFCBANK.NS': 'HDFC Bank',
-        'ICICIBANK.NS': 'ICICI Bank', 'WIPRO.NS': 'Wipro',
-        'BAJFINANCE.NS': 'Bajaj Finance', 'ADANIENT.NS': 'Adani Enterprises',
-        'NIFTY50.NS': 'Nifty 50 Index', 'SENSEX.BO': 'BSE Sensex',
+        'ORCL': 'Oracle', 'AMD': 'AMD', 'INTC': 'Intel', 'NFLX': 'Netflix',
+        'DIS': 'Disney', 'BA': 'Boeing', 'WMT': 'Walmart', 'V': 'Visa',
     }
     q_upper = q.upper()
     results = [
-        {'ticker': k, 'name': v,
-         'market': '🇮🇳 NSE' if '.NS' in k else ('🇮🇳 BSE' if '.BO' in k else '🇺🇸 US')}
+        {'ticker': k, 'name': v, 'market': '🇺🇸 US'}
         for k, v in suggestions.items()
         if q_upper in k or q_upper in v.upper()
     ]
