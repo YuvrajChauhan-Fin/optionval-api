@@ -1,11 +1,11 @@
 """
 Options Valuation Engine — FastAPI Backend
 ==========================================
-Phase 3: Live Market Data Layer
+Phase 4: Massive.com Market Data Layer
 
 Endpoints:
   GET /api/quote/{ticker}          — Live stock price + company info
-  GET /api/chain/{ticker}          — Full options chain with IV + Greeks
+  GET /api/chain/{ticker}          — Full options chain with BS prices + Greeks
   GET /api/surface/{ticker}        — Vol surface data across strikes/expiries
   GET /api/compare/{ticker}        — Model vs market mispricing analysis
   GET /api/search?q=               — Ticker search
@@ -17,20 +17,17 @@ Market support:
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import pandas as pd
-import yfinance as yf
 import numpy as np
 import math
 import time
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import traceback
 
 app = FastAPI(
     title="Options Valuation Engine API",
-    description="Phase 3: Live market data + pricing engine",
-    version="3.1"
+    description="Phase 4: Massive.com market data + pricing engine",
+    version="4.0"
 )
 
 app.add_middleware(
@@ -41,25 +38,23 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# SHARED SESSION — custom headers bypass Yahoo rate limiting
+# MASSIVE.COM API CONFIG
 # ---------------------------------------------------------------------------
 
-_session = requests.Session()
-_session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-})
+MASSIVE_API_KEY = "SV4Mf7QHtAb7tsTjYBZNlH58p8Zeq4Su"
+MASSIVE_BASE    = "https://api.massive.com"
 
 # ---------------------------------------------------------------------------
-# IN-MEMORY CACHE  (5-minute TTL)
+# IN-MEMORY CACHE
 # ---------------------------------------------------------------------------
 
 _cache: dict = {}
-CACHE_TTL = 300  # seconds
+CACHE_TTL       = 60   # seconds — quotes
+CACHE_TTL_CHAIN = 45   # seconds — option chains / surface / compare
 
-def cache_get(key: str):
+def cache_get(key: str, ttl: int = CACHE_TTL):
     entry = _cache.get(key)
-    if entry and (time.time() - entry['ts']) < CACHE_TTL:
+    if entry and (time.time() - entry['ts']) < ttl:
         return entry['data']
     return None
 
@@ -67,7 +62,7 @@ def cache_set(key: str, data):
     _cache[key] = {'data': data, 'ts': time.time()}
 
 # ---------------------------------------------------------------------------
-# BLACK-SCHOLES ENGINE (self-contained, no import dependency)
+# BLACK-SCHOLES ENGINE (self-contained, no scipy)
 # ---------------------------------------------------------------------------
 
 def norm_cdf(x):
@@ -84,7 +79,7 @@ def bs_d1d2(S, K, T, r, sigma, q=0):
 
 def bs_price(S, K, T, r, sigma, q=0, option_type='call'):
     if T <= 0:
-        return max(S-K, 0) if option_type=='call' else max(K-S, 0)
+        return max(S-K, 0) if option_type == 'call' else max(K-S, 0)
     d1, d2 = bs_d1d2(S, K, T, r, sigma, q)
     exp_q, exp_r = np.exp(-q*T), np.exp(-r*T)
     if option_type == 'call':
@@ -98,17 +93,17 @@ def bs_greeks(S, K, T, r, sigma, q=0, option_type='call'):
     sqrt_T = np.sqrt(T)
     exp_q, exp_r = np.exp(-q*T), np.exp(-r*T)
     nd1 = norm_pdf(d1)
-    delta = exp_q*norm_cdf(d1) if option_type=='call' else exp_q*(norm_cdf(d1)-1)
+    delta = exp_q*norm_cdf(d1) if option_type == 'call' else exp_q*(norm_cdf(d1)-1)
     gamma = exp_q*nd1 / (S*sigma*sqrt_T)
     vega  = S*exp_q*nd1*sqrt_T / 100
     t1    = -(S*exp_q*nd1*sigma) / (2*sqrt_T)
-    t2    = (q*S*exp_q*norm_cdf(d1) - r*K*exp_r*norm_cdf(d2)) if option_type=='call' \
+    t2    = (q*S*exp_q*norm_cdf(d1) - r*K*exp_r*norm_cdf(d2)) if option_type == 'call' \
             else (-q*S*exp_q*norm_cdf(-d1) + r*K*exp_r*norm_cdf(-d2))
     theta = (t1+t2)/365
-    rho   = K*T*exp_r*norm_cdf(d2)/100 if option_type=='call' \
+    rho   = K*T*exp_r*norm_cdf(d2)/100 if option_type == 'call' \
             else -K*T*exp_r*norm_cdf(-d2)/100
-    return {'delta':round(delta,6),'gamma':round(gamma,6),
-            'vega':round(vega,6),'theta':round(theta,6),'rho':round(rho,6)}
+    return {'delta': round(delta,6), 'gamma': round(gamma,6),
+            'vega':  round(vega,6),  'theta': round(theta,6), 'rho': round(rho,6)}
 
 def implied_vol(market_price, S, K, T, r, q=0, option_type='call'):
     """Newton-Raphson IV solver."""
@@ -138,19 +133,37 @@ def detect_market(ticker: str) -> dict:
 def get_risk_free_rate(market: str) -> float:
     return 0.0525
 
-def safe_fast(fi, attr, default=None):
-    """Safely read a fast_info attribute, returning default on any failure."""
-    try:
-        val = getattr(fi, attr, default)
-        return val if val is not None else default
-    except Exception:
-        return default
+def moneyness_label(S: float, K: float) -> str:
+    ratio = S / K
+    if ratio > 1.005: return 'ITM'
+    if ratio < 0.995: return 'OTM'
+    return 'ATM'
 
-def flatten_download(hist: pd.DataFrame) -> pd.DataFrame:
-    """Collapse multi-level columns from yf.download() to single level."""
-    if isinstance(hist.columns, pd.MultiIndex):
-        hist.columns = hist.columns.get_level_values(0)
-    return hist
+def time_to_expiry(expiration_date_str: str) -> float:
+    """Returns T in years from now (minimum 0.001)."""
+    exp = datetime.strptime(expiration_date_str, '%Y-%m-%d')
+    T = (exp - datetime.utcnow()).days / 365
+    return max(T, 0.001)
+
+def massive_req(path: str, params: dict = None, timeout: int = 8) -> dict:
+    """Generic Massive.com REST call with apiKey query-param auth."""
+    if params is None:
+        params = {}
+    params["apiKey"] = MASSIVE_API_KEY
+    url = f"{MASSIVE_BASE}{path}"
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+    except requests.Timeout:
+        raise HTTPException(504, detail=f"Massive.com timed out: {path}")
+    except requests.ConnectionError as e:
+        raise HTTPException(503, detail=f"Connection error: {e}")
+    if resp.status_code == 403:
+        raise HTTPException(403, detail="Massive.com plan does not include this endpoint.")
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, detail=f"Massive.com error: {resp.text[:200]}")
+    return resp.json()
 
 # ---------------------------------------------------------------------------
 # ENDPOINTS
@@ -158,80 +171,73 @@ def flatten_download(hist: pd.DataFrame) -> pd.DataFrame:
 
 @app.get("/health")
 def health():
-    return {"status": "online", "timestamp": datetime.utcnow().isoformat(), "version": "3.1"}
+    return {"status": "online", "timestamp": datetime.utcnow().isoformat(), "version": "4.0"}
 
 
 @app.get("/api/quote/{ticker}")
 def get_quote(ticker: str):
     """
-    Robust quote endpoint with layered fallbacks:
-      1. fast_info  — price, market cap, 52-week range (fast, low rate-limit)
-      2. t.history  — 30d OHLCV for historical vol (separate endpoint)
-      3. t.info     — name, sector, dividend yield (slower; isolated try/except)
-      4. yf.download — last-resort price if fast_info fails entirely
+    Stock quote from Massive.com REST API:
+      1. /v2/aggs/ticker/{sym}/prev     — previous-day OHLCV (price, volume)
+      2. /v2/aggs/ticker/{sym}/range    — 30-day daily bars for historical vol
+      3. /v3/reference/tickers/{sym}    — company name, description (best-effort)
     """
     cache_key = f"quote:{ticker.upper()}"
-    cached = cache_get(cache_key)
+    cached = cache_get(cache_key, ttl=CACHE_TTL)
     if cached:
         return cached
     try:
-        sym          = ticker.upper()
-        market_info  = detect_market(ticker)
-        r            = get_risk_free_rate(market_info['market'])
-        t            = yf.Ticker(sym, session=_session)
+        sym         = ticker.upper()
+        market_info = detect_market(ticker)
+        r           = get_risk_free_rate(market_info['market'])
 
-        # ── 1. fast_info: price + market metadata ──────────────────────────
-        fi           = t.fast_info
-        price        = safe_fast(fi, 'last_price')
-        prev_close   = safe_fast(fi, 'previous_close')
-        market_cap   = safe_fast(fi, 'market_cap') or 0
-        volume       = safe_fast(fi, 'three_month_average_volume') \
-                       or safe_fast(fi, 'regular_market_volume') or 0
-        week52_high  = safe_fast(fi, 'fifty_two_week_high')
-        week52_low   = safe_fast(fi, 'fifty_two_week_low')
-        currency     = safe_fast(fi, 'currency') or market_info['currency']
-        exchange     = safe_fast(fi, 'exchange') or market_info['exchange']
-
-        # ── 2. t.history: 30-day OHLCV for historical vol ─────────────────
-        hist         = t.history(period='30d')
-        hist_vol     = 0.25  # default
-        if not hist.empty:
-            close    = hist['Close'].dropna()
-            if len(close) >= 5:
-                log_returns = np.log(close / close.shift(1)).dropna()
-                hist_vol    = float(log_returns.std() * np.sqrt(252))
-            # fill price from history if fast_info gave nothing
-            if not price and len(close):
-                price = float(close.iloc[-1])
-            if not prev_close and len(close) > 1:
-                prev_close = float(close.iloc[-2])
-
-        # ── 3. yf.download fallback if price still missing ─────────────────
-        if not price:
-            dl   = yf.download(sym, period='1d', progress=False, session=_session)
-            dl   = flatten_download(dl)
-            if not dl.empty:
-                price = float(dl['Close'].dropna().iloc[-1])
+        # ── 1. Previous-day close ─────────────────────────────────────────
+        prev_resp    = massive_req(f"/v2/aggs/ticker/{sym}/prev")
+        prev_results = prev_resp.get('results', [])
+        if not prev_results:
+            raise HTTPException(404, f"No price data found for '{ticker}'")
+        bar        = prev_results[0]
+        price      = float(bar.get('c', 0))
+        prev_close = float(bar.get('c', price))
+        volume     = int(bar.get('v', 0))
 
         if not price:
             raise HTTPException(404, f"No price data found for '{ticker}'")
 
-        if not prev_close:
-            prev_close = price
-        change     = price - prev_close
-        change_pct = (change / prev_close) * 100 if prev_close else 0
+        # ── 2. 30-day daily bars for historical vol ───────────────────────
+        from_date = (date.today() - timedelta(days=45)).isoformat()
+        to_date   = date.today().isoformat()
+        bars_resp = massive_req(
+            f"/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
+            params={'adjusted': 'true', 'sort': 'asc', 'limit': 50}
+        )
+        hist_vol    = 0.25
+        week52_high = None
+        week52_low  = None
+        bars = bars_resp.get('results', [])
+        if len(bars) >= 5:
+            closes   = [float(b['c']) for b in bars]
+            log_ret  = [np.log(closes[i]/closes[i-1]) for i in range(1, len(closes))]
+            hist_vol = float(np.std(log_ret) * np.sqrt(252))
+            week52_high = max(float(b['h']) for b in bars)
+            week52_low  = min(float(b['l']) for b in bars)
 
-        # ── 4. t.info: name, sector, dividend yield (best-effort) ──────────
+        # ── 3. Reference ticker — name, sector (best-effort) ─────────────
         name           = sym
         sector         = 'N/A'
+        market_cap     = 0
         dividend_yield = 0.0
         try:
-            info           = t.info
-            name           = info.get('longName') or info.get('shortName') or sym
-            sector         = info.get('sector') or 'N/A'
-            dividend_yield = round(min(max(float(info.get('dividendYield') or 0), 0), 0.20), 4)
-        except Exception as info_err:
-            print(f"WARN [quote/{sym}] t.info failed (non-fatal): {info_err}", flush=True)
+            ref_resp = massive_req(f"/v3/reference/tickers/{sym}")
+            ref      = ref_resp.get('results', {})
+            name      = ref.get('name') or sym
+            sector    = ref.get('sic_description') or ref.get('type') or 'N/A'
+            market_cap = int(ref.get('market_cap') or 0)
+        except Exception as ref_err:
+            print(f"WARN [quote/{sym}] reference failed (non-fatal): {ref_err}", flush=True)
+
+        change     = price - prev_close if prev_close else 0
+        change_pct = (change / prev_close * 100) if prev_close else 0
 
         result = {
             "ticker":         sym,
@@ -241,16 +247,16 @@ def get_quote(ticker: str):
             "prev_close":     round(prev_close, 2),
             "change":         round(change, 2),
             "change_pct":     round(change_pct, 3),
-            "volume":         int(volume or 0),
-            "market_cap":     int(market_cap or 0),
+            "volume":         volume,
+            "market_cap":     market_cap,
             "week52_high":    round(week52_high, 2) if week52_high else None,
             "week52_low":     round(week52_low, 2)  if week52_low  else None,
             "dividend_yield": dividend_yield,
             "hist_vol_30d":   round(hist_vol, 4),
             "risk_free_rate": r,
-            "currency":       currency,
+            "currency":       market_info['currency'],
             "market":         market_info['market'],
-            "exchange":       exchange,
+            "exchange":       market_info['exchange'],
             "flag":           market_info['flag'],
             "timestamp":      datetime.utcnow().isoformat(),
         }
@@ -267,91 +273,88 @@ def get_quote(ticker: str):
 @app.get("/api/chain/{ticker}")
 def get_options_chain(ticker: str, expiry: str = None):
     """
-    Full options chain with market prices, BS IV, and Greeks.
-    Uses fast_info for spot price, option_chain() for contract data.
+    Options chain from Massive.com reference contracts.
+    Returns BS-theoretical prices + Greeks for each contract.
+    No market bid/ask — purely model-based using hist_vol_30d as sigma.
     """
     cache_key = f"chain:{ticker.upper()}:{expiry or ''}"
-    cached = cache_get(cache_key)
+    cached = cache_get(cache_key, ttl=CACHE_TTL_CHAIN)
     if cached:
         return cached
     try:
-        quote    = get_quote(ticker)
-        S        = quote['price']
-        r        = quote['risk_free_rate']
-        q        = quote['dividend_yield']
+        quote = get_quote(ticker)
+        S     = quote['price']
+        r     = quote['risk_free_rate']
+        q     = quote['dividend_yield']
+        sigma = quote['hist_vol_30d']
+        sym   = ticker.upper()
 
-        t        = yf.Ticker(ticker.upper(), session=_session)
-        expiries = t.options
+        today  = date.today().isoformat()
+        params = {
+            'underlying_ticker':    sym,
+            'expiration_date.gte':  today,
+            'expired':              'false',
+            'strike_price.gte':     round(S * 0.80),
+            'strike_price.lte':     round(S * 1.20),
+            'limit':                250,
+            'order':                'asc',
+            'sort':                 'expiration_date',
+        }
+        resp    = massive_req('/v3/reference/options/contracts', params)
+        results = resp.get('results', [])
 
-        if not expiries:
-            raise HTTPException(404, f"No options data available for {ticker}.")
+        if not results:
+            raise HTTPException(404, f"No options contracts found for {sym}.")
 
+        # Collect unique expiries (already sorted asc by sort param)
+        expiries   = sorted(set(c['expiration_date'] for c in results))
         target_exp = expiry if expiry in expiries else expiries[0]
-        chain      = t.option_chain(target_exp)
+        T          = time_to_expiry(target_exp)
 
-        exp_date   = datetime.strptime(target_exp, '%Y-%m-%d')
-        T          = max((exp_date - datetime.utcnow()).days / 365, 0.001)
+        calls, puts = [], []
+        for c in results:
+            if c['expiration_date'] != target_exp:
+                continue
+            K     = float(c['strike_price'])
+            ctype = c['contract_type']   # 'call' or 'put'
 
-        def process_chain(df, option_type):
-            results = []
-            for _, row in df.iterrows():
-                K           = float(row['strike'])
-                market_px   = float(row.get('lastPrice') or 0)
-                bid         = float(row.get('bid') or 0)
-                ask         = float(row.get('ask') or 0)
-                mid         = (bid+ask)/2 if bid>0 and ask>0 else market_px
-                volume      = int(float(str(row.get('volume') or 0).replace('nan', '0')))
-                oi          = int(float(str(row.get('openInterest') or 0).replace('nan', '0')))
+            bs_px  = bs_price(S, K, T, r, sigma, q, ctype)
+            greeks = bs_greeks(S, K, T, r, sigma, q, ctype)
+            mono   = moneyness_label(S, K)
 
-                if mid <= 0 and market_px <= 0:
-                    continue
-
-                price_for_iv = mid if mid > 0 else market_px
-                iv           = implied_vol(price_for_iv, S, K, T, r, q, option_type)
-                sigma        = iv if iv else quote['hist_vol_30d']
-
-                bs_px        = bs_price(S, K, T, r, sigma, q, option_type)
-                greeks       = bs_greeks(S, K, T, r, sigma, q, option_type)
-
-                moneyness_ratio = S/K if option_type=='call' else K/S
-                if moneyness_ratio > 1.005:   moneyness = 'ITM'
-                elif moneyness_ratio < 0.995: moneyness = 'OTM'
-                else:                          moneyness = 'ATM'
-
-                mispricing = round(bs_px - price_for_iv, 4)
-
-                results.append({
-                    'strike':        round(K, 2),
-                    'expiry':        target_exp,
-                    'type':          option_type,
-                    'bid':           round(bid, 2),
-                    'ask':           round(ask, 2),
-                    'mid':           round(mid, 2),
-                    'last':          round(market_px, 2),
-                    'volume':        volume,
-                    'open_interest': oi,
-                    'iv':            round(iv*100, 2) if iv else None,
-                    'bs_price':      round(bs_px, 4),
-                    'mispricing':    mispricing,
-                    'moneyness':     moneyness,
-                    **{f'greek_{k}': v for k,v in greeks.items()},
-                })
-            return results
-
-        calls = process_chain(chain.calls, 'call')
-        puts  = process_chain(chain.puts,  'put')
+            contract = {
+                'strike':        round(K, 2),
+                'expiry':        target_exp,
+                'type':          ctype,
+                'bid':           None,
+                'ask':           None,
+                'mid':           None,
+                'last':          None,
+                'volume':        None,
+                'open_interest': None,
+                'iv':            None,
+                'bs_price':      round(bs_px, 4),
+                'mispricing':    0,
+                'moneyness':     mono,
+                'log_moneyness': round(float(np.log(K/S)), 4),
+                **{f'greek_{k}': v for k, v in greeks.items()},
+            }
+            if ctype == 'call':
+                calls.append(contract)
+            else:
+                puts.append(contract)
 
         result = {
-            'ticker':          ticker.upper(),
+            'ticker':          sym,
             'spot':            S,
             'expiry':          target_exp,
             'T':               round(T, 4),
             'r':               r,
             'q':               q,
-            'all_expiries':    list(expiries),
+            'all_expiries':    expiries,
             'calls':           calls,
             'puts':            puts,
-            'total_contracts': len(calls)+len(puts),
+            'total_contracts': len(calls) + len(puts),
             'timestamp':       datetime.utcnow().isoformat(),
         }
         cache_set(cache_key, result)
@@ -367,59 +370,78 @@ def get_options_chain(ticker: str, expiry: str = None):
 @app.get("/api/surface/{ticker}")
 def get_vol_surface(ticker: str):
     """
-    Volatility surface: IV across all strikes and up to 6 expiries.
-    Uses fast_info for spot, option_chain() per expiry for IV data.
+    Volatility surface built from Massive.com reference contracts.
+    Uses hist_vol_30d as uniform sigma across all strikes/expiries.
+    Returns expiries, strikes, and iv_grid for 3D/heatmap rendering.
     """
     cache_key = f"surface:{ticker.upper()}"
-    cached = cache_get(cache_key)
+    cached = cache_get(cache_key, ttl=CACHE_TTL_CHAIN)
     if cached:
         return cached
     try:
-        quote    = get_quote(ticker)
-        S        = quote['price']
-        r        = quote['risk_free_rate']
-        q        = quote['dividend_yield']
+        quote = get_quote(ticker)
+        S     = quote['price']
+        r     = quote['risk_free_rate']
+        q     = quote['dividend_yield']
+        sigma = quote['hist_vol_30d']
+        sym   = ticker.upper()
 
-        t        = yf.Ticker(ticker.upper(), session=_session)
-        expiries = t.options
+        today  = date.today().isoformat()
+        params = {
+            'underlying_ticker':    sym,
+            'expiration_date.gte':  today,
+            'expired':              'false',
+            'strike_price.gte':     round(S * 0.80),
+            'strike_price.lte':     round(S * 1.20),
+            'contract_type':        'call',
+            'limit':                250,
+            'order':                'asc',
+            'sort':                 'expiration_date',
+        }
+        resp    = massive_req('/v3/reference/options/contracts', params)
+        results = resp.get('results', [])
 
-        if not expiries:
+        if not results:
             raise HTTPException(404, "No options data for surface construction.")
 
-        surface_data = []
-        for exp in expiries[:6]:
-            try:
-                chain    = t.option_chain(exp)
-                exp_date = datetime.strptime(exp, '%Y-%m-%d')
-                T        = max((exp_date - datetime.utcnow()).days / 365, 0.001)
-                days     = round(T * 365)
+        # Use first 6 unique expiries
+        all_exp_sorted = sorted(set(c['expiration_date'] for c in results))
+        expiries_used  = all_exp_sorted[:6]
 
-                for _, row in chain.calls.iterrows():
-                    K   = float(row['strike'])
-                    bid = float(row.get('bid') or 0)
-                    ask = float(row.get('ask') or 0)
-                    mid = (bid+ask)/2 if bid>0 and ask>0 else float(row.get('lastPrice') or 0)
-                    if mid <= 0:
-                        continue
-                    iv = implied_vol(mid, S, K, T, r, q, 'call')
-                    if iv and 0.01 < iv < 3.0:
-                        surface_data.append({
-                            'strike':        round(K, 2),
-                            'expiry':        exp,
-                            'days':          days,
-                            'T':             round(T, 4),
-                            'iv':            round(iv*100, 2),
-                            'log_moneyness': round(float(np.log(K/S)), 4),
-                            'moneyness':     round(K/S, 4),
-                        })
-            except Exception:
+        surface_data = []
+        for c in results:
+            if c['expiration_date'] not in expiries_used:
                 continue
+            K    = float(c['strike_price'])
+            T    = time_to_expiry(c['expiration_date'])
+            days = round(T * 365)
+            surface_data.append({
+                'strike':        round(K, 2),
+                'expiry':        c['expiration_date'],
+                'days':          days,
+                'T':             round(T, 4),
+                'iv':            round(sigma * 100, 2),
+                'log_moneyness': round(float(np.log(K/S)), 4),
+                'moneyness':     round(K/S, 4),
+            })
+
+        # Build grid arrays for 3D/heatmap rendering
+        all_strikes  = sorted(set(p['strike'] for p in surface_data))
+        all_expiries = sorted(set(p['expiry'] for p in surface_data))
+        iv_lookup    = {(p['expiry'], p['strike']): p['iv'] for p in surface_data}
+        iv_grid      = [
+            [iv_lookup.get((exp, s)) for s in all_strikes]
+            for exp in all_expiries
+        ]
 
         result = {
-            'ticker':        ticker.upper(),
+            'ticker':        sym,
             'spot':          S,
             'surface':       surface_data,
-            'expiries_used': list(expiries[:6]),
+            'expiries':      all_expiries,
+            'strikes':       all_strikes,
+            'iv_grid':       iv_grid,
+            'expiries_used': expiries_used,
             'points':        len(surface_data),
             'timestamp':     datetime.utcnow().isoformat(),
         }
@@ -436,11 +458,12 @@ def get_vol_surface(ticker: str):
 @app.get("/api/compare/{ticker}")
 def get_model_comparison(ticker: str, expiry: str = None):
     """
-    Model vs Market: BS mispricing analysis across all strikes.
-    Reuses cached chain data — no additional yfinance calls.
+    Model comparison across all contracts in the chain.
+    Since market prices are unavailable from the reference endpoint,
+    market_price and market_iv are None; mispricing is 0.
     """
     cache_key = f"compare:{ticker.upper()}:{expiry or ''}"
-    cached = cache_get(cache_key)
+    cached = cache_get(cache_key, ttl=CACHE_TTL_CHAIN)
     if cached:
         return cached
     try:
@@ -449,19 +472,18 @@ def get_model_comparison(ticker: str, expiry: str = None):
 
         comparison = []
         for contract in chain_data['calls'] + chain_data['puts']:
-            if contract['iv'] is None:
-                continue
+            mid = contract.get('mid')
             comparison.append({
                 'strike':         contract['strike'],
                 'type':           contract['type'],
                 'moneyness':      contract['moneyness'],
                 'log_moneyness':  round(float(np.log(contract['strike']/S)), 4),
                 'market_iv':      contract['iv'],
-                'market_price':   contract['mid'],
+                'market_price':   mid,
                 'bs_price':       contract['bs_price'],
                 'mispricing':     contract['mispricing'],
-                'mispricing_pct': round((contract['mispricing'] / contract['mid'])*100, 2)
-                                  if contract['mid'] > 0 else 0,
+                'mispricing_pct': (round((contract['mispricing'] / mid)*100, 2)
+                                   if mid and mid > 0 else 0),
                 'delta':          contract['greek_delta'],
                 'gamma':          contract['greek_gamma'],
             })
@@ -472,9 +494,9 @@ def get_model_comparison(ticker: str, expiry: str = None):
         max_under    = min(comparison, key=lambda x: x['mispricing']) if comparison else {}
 
         result = {
-            'ticker':   ticker.upper(),
-            'spot':     S,
-            'expiry':   chain_data['expiry'],
+            'ticker':    ticker.upper(),
+            'spot':      S,
+            'expiry':    chain_data['expiry'],
             'contracts': comparison,
             'summary': {
                 'avg_mispricing':  avg_misprice,
